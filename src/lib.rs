@@ -1,4 +1,4 @@
 mod ecdsa;
 
 pub use ec_generic::{EllipticCurve, FiniteField, Point};
-pub use ecdsa::{ECDSA, ECDSAErrors};
+pub use ecdsa::{ECDSAErrors, ECDSA};
