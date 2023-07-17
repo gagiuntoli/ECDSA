@@ -65,9 +65,9 @@ dependencies = [
 
 [[package]]
 name = "ec-generic"
-version = "0.1.10"
+version = "0.1.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "da59a092b5e2ea35e4e39f44e3d7f41c931afd7bca5697792839fce2e8f2bfbf"
+checksum = "dd52b0f4365ed46dcb86449c755f9b7f459ed119fa453915ba4ba2c5cb75ef4e"
 dependencies = [
  "num-bigint",
 ]

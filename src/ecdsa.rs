@@ -1,6 +1,5 @@
 use ec_generic::{EllipticCurve, FiniteField, Point};
 use num_bigint::{BigUint, RandBigInt};
-use rand;
 use sha256::digest;
 
 pub struct ECDSA {
@@ -9,26 +8,33 @@ pub struct ECDSA {
     q_order: BigUint,
 }
 
+#[derive(Debug)]
+pub enum ECDSAErrors {
+   BadArgument(String),
+   OperationFailure(String),
+}
+
 impl ECDSA {
     // Generates: d, B where B = d A
-    pub fn generate_key_pair(&self) -> (BigUint, Point) {
+    pub fn generate_key_pair(&self) -> Result<(BigUint, Point), ECDSAErrors> {
         let priv_key = self.generate_priv_key();
-        let pub_key = self.generate_pub_key(&priv_key);
-        (priv_key, pub_key)
+        let pub_key = self.generate_pub_key(&priv_key)?;
+        Ok((priv_key, pub_key))
     }
 
     pub fn generate_priv_key(&self) -> BigUint {
         self.generate_random_positive_number_less_than(&self.q_order)
     }
 
-    pub fn generate_pub_key(&self, priv_key: &BigUint) -> Point {
-        self.elliptic_curve.scalar_mul(&self.a_gen, &priv_key)
+    pub fn generate_pub_key(&self, priv_key: &BigUint) -> Result<Point, ECDSAErrors> {
+        self.elliptic_curve.scalar_mul(&self.a_gen, priv_key)
+            .map_err(|_| ECDSAErrors::OperationFailure("Error computing priv_key * a_gen".into()))
     }
 
     // (0, max)
     pub fn generate_random_positive_number_less_than(&self, max: &BigUint) -> BigUint {
         let mut rng = rand::thread_rng();
-        rng.gen_biguint_range(&BigUint::from(1u32), &max)
+        rng.gen_biguint_range(&BigUint::from(1u32), max)
     }
 
     ///
@@ -40,69 +46,89 @@ impl ECDSA {
         hash: &BigUint,
         priv_key: &BigUint,
         k_random: &BigUint,
-    ) -> (BigUint, BigUint) {
-        assert!(
-            *hash < self.q_order,
-            "Hash is bigger than the order of the EC group"
-        );
-        assert!(
-            *priv_key < self.q_order,
-            "Private key is bigger than the order of the EC group"
-        );
-        assert!(
-            *k_random < self.q_order,
-            "Random number `k` is bigger than the order of the EC group"
-        );
-
-        let r_point = self.elliptic_curve.scalar_mul(&self.a_gen, k_random);
-
-        if let Point::Coor(r, _) = r_point {
-            let s = FiniteField::mult(&r, priv_key, &self.q_order);
-            let s = FiniteField::add(&s, hash, &self.q_order);
-            let k_inv = FiniteField::inv_mult_prime(k_random, &self.q_order);
-            let s = FiniteField::mult(&s, &k_inv, &self.q_order);
-
-            return (r, s);
+    ) -> Result<(BigUint, BigUint), ECDSAErrors> {
+        if *hash >= self.q_order {
+            return Err(ECDSAErrors::BadArgument("Hash is bigger than the order of the EC group".into()));
         }
 
-        panic!("The random point R should not be the identity");
+        if *priv_key >= self.q_order {
+            return Err(ECDSAErrors::BadArgument("Private key is bigger than the order of the EC group".into()));
+        }
+
+        if *k_random >= self.q_order {
+            return Err(ECDSAErrors::BadArgument("Random number `k` is bigger than the order of the EC group".into()));
+        }
+
+        let r_point = self.elliptic_curve.scalar_mul(&self.a_gen, k_random)
+            .map_err(|_| ECDSAErrors::OperationFailure("Error computing k_random * a_gen".into()))?;
+
+        if let Point::Coor(r, _) = r_point {
+            let s = FiniteField::mult(&r, priv_key, &self.q_order)
+                .map_err(|_| ECDSAErrors::OperationFailure("Error multiplying r * priv_key".into()))?;
+
+            let s = FiniteField::add(&s, hash, &self.q_order)
+                .map_err(|_| ECDSAErrors::OperationFailure("Error adding hash + r * priv_key".into()))?;
+
+            let k_inv = FiniteField::inv_mult_prime(k_random, &self.q_order)
+                .map_err(|_| ECDSAErrors::OperationFailure("Error computing k_inv".into()))?;
+
+            let s = FiniteField::mult(&s, &k_inv, &self.q_order)
+                .map_err(|_| ECDSAErrors::OperationFailure("Error computing (hash + r * priv_key) * k_inv".into()))?;
+
+            return Ok((r, s));
+        }
+
+        Err(ECDSAErrors::OperationFailure("Result k_random * a_gen is the identity".into()))
     }
 
     ///
+    /// Verifies if a signature is valid for a particular message hash and public key.
+    ///
+    /// (s, r) = signature
     /// u1 = s^(-1) * hash(message) mod q
     /// u2 = s^(-1) * r mod q
     /// P = u1 A + u2 B mod q = (xp, yp)
     /// if r == xp then verified!
     ///
-    pub fn verify(&self, hash: &BigUint, pub_key: &Point, signature: &(BigUint, BigUint)) -> bool {
-        assert!(
-            *hash < self.q_order,
-            "Hash is bigger than the order of the EC group"
-        );
-
-        let (r, s) = signature;
-        let s_inv = FiniteField::inv_mult_prime(&s, &self.q_order);
-        let u1 = FiniteField::mult(&s_inv, hash, &self.q_order);
-        let u2 = FiniteField::mult(&s_inv, &r, &self.q_order);
-        let u1a = self.elliptic_curve.scalar_mul(&self.a_gen, &u1);
-        let u2b = self.elliptic_curve.scalar_mul(&pub_key, &u2);
-        let p = self.elliptic_curve.add(&u1a, &u2b);
-
-        if let Point::Coor(xp, _) = p {
-            return xp == *r;
+    pub fn verify(&self, hash: &BigUint, pub_key: &Point, signature: &(BigUint, BigUint)) -> Result<bool, ECDSAErrors>  {
+        if *hash >= self.q_order {
+            return Err(ECDSAErrors::BadArgument("Hash value >= q (EC group order)".to_string()));
         }
 
-        panic!("Point P = u1 A + u2 B cannot be the identity");
+        let (r, s) = signature;
+
+        let s_inv = FiniteField::inv_mult_prime(s, &self.q_order)
+            .map_err(|_| ECDSAErrors::OperationFailure("Error computing s_inv".into()))?;
+
+        let u1 = FiniteField::mult(&s_inv, hash, &self.q_order)
+            .map_err(|_| ECDSAErrors::OperationFailure("Error multiplying s_inv and hash".into()))?;
+
+        let u2 = FiniteField::mult(&s_inv, r, &self.q_order)
+            .map_err(|_| ECDSAErrors::OperationFailure("Error multiplying s_inv and r".into()))?;
+
+        let u1a = self.elliptic_curve.scalar_mul(&self.a_gen, &u1)
+                .map_err(|_| ECDSAErrors::OperationFailure("Error in u1 * a_gen".into()))?;
+
+        let u2b = self.elliptic_curve.scalar_mul(pub_key, &u2)
+                .map_err(|_| ECDSAErrors::OperationFailure("Error in u2 * pub_key".into()))?;
+
+        let p = self.elliptic_curve.add(&u1a, &u2b)
+                .map_err(|_| ECDSAErrors::OperationFailure("Error in u1a + u2b".into()))?;
+
+        if let Point::Coor(xp, _) = p {
+            return Ok(xp == *r);
+        }
+
+        Err(ECDSAErrors::OperationFailure("Result is the identity".into()))
     }
 
     /// 0 < hash < max
     pub fn generate_hash_less_than(&self, message: &str, max: &BigUint) -> BigUint {
         let digest = digest(message);
-        let hash_bytes = hex::decode(&digest).expect("Could not convert hash to Vec<u8>");
+        let hash_bytes = hex::decode(digest).expect("Could not convert hash to Vec<u8>");
         let hash = BigUint::from_bytes_be(&hash_bytes);
         let hash = hash.modpow(&BigUint::from(1u32), &(max - BigUint::from(1u32)));
-        let hash = hash + BigUint::from(1u32);
-        hash
+        hash + BigUint::from(1u32)
     }
 }
 
@@ -129,16 +155,16 @@ mod test {
         };
 
         let priv_key = BigUint::from(7u32);
-        let pub_key = ecdsa.generate_pub_key(&priv_key);
+        let pub_key = ecdsa.generate_pub_key(&priv_key).expect("Could not compute PubKey");
 
         let k_random = BigUint::from(18u32);
 
         let message = "Bob -> 1 BTC -> Alice";
         let hash = ecdsa.generate_hash_less_than(message, &ecdsa.q_order);
 
-        let signature = ecdsa.sign(&hash, &priv_key, &k_random);
+        let signature = ecdsa.sign(&hash, &priv_key, &k_random).expect("Could not sign");
 
-        let verify_result = ecdsa.verify(&hash, &pub_key, &signature);
+        let verify_result = ecdsa.verify(&hash, &pub_key, &signature).expect("Could not verify");
 
         assert!(verify_result, "Verification should success");
     }
@@ -162,19 +188,19 @@ mod test {
         };
 
         let priv_key = BigUint::from(7u32);
-        let pub_key = ecdsa.generate_pub_key(&priv_key);
+        let pub_key = ecdsa.generate_pub_key(&priv_key).expect("Could not compute PubKey");
 
         let k_random = BigUint::from(18u32);
 
         let message = "Bob -> 1 BTC -> Alice";
         let hash = ecdsa.generate_hash_less_than(message, &ecdsa.q_order);
 
-        let signature = ecdsa.sign(&hash, &priv_key, &k_random);
+        let signature = ecdsa.sign(&hash, &priv_key, &k_random).expect("Could not sign");
 
         let message = "Bob -> 2 BTC -> Alice";
         let hash = ecdsa.generate_hash_less_than(message, &ecdsa.q_order);
 
-        let verify_result = ecdsa.verify(&hash, &pub_key, &signature);
+        let verify_result = ecdsa.verify(&hash, &pub_key, &signature).expect("Could not verify");
 
         assert!(
             !verify_result,
@@ -201,21 +227,23 @@ mod test {
         };
 
         let priv_key = BigUint::from(7u32);
-        let pub_key = ecdsa.generate_pub_key(&priv_key);
+        let pub_key = ecdsa.generate_pub_key(&priv_key).expect("Could not compute PubKey");
 
         let k_random = BigUint::from(13u32);
 
         let message = "Bob -> 1 BTC -> Alice";
         let hash = ecdsa.generate_hash_less_than(message, &ecdsa.q_order);
 
-        let signature = ecdsa.sign(&hash, &priv_key, &k_random);
+        let signature = ecdsa.sign(&hash, &priv_key, &k_random).expect("Could not sign");
+
         let (r, s) = signature;
+
         let tempered_signature = (
             (r + BigUint::from(1u32)).modpow(&BigUint::from(1u32), &ecdsa.q_order),
             s,
         );
 
-        let verify_result = ecdsa.verify(&hash, &pub_key, &tempered_signature);
+        let verify_result = ecdsa.verify(&hash, &pub_key, &tempered_signature).expect("Could not verify");
 
         assert!(
             !verify_result,
@@ -269,7 +297,7 @@ mod test {
         )
         .expect("Could not convert hex to private key");
 
-        let pub_key = ecdsa.generate_pub_key(&priv_key);
+        let pub_key = ecdsa.generate_pub_key(&priv_key).expect("Could not compute PubKey");
 
         let k_random = BigUint::parse_bytes(
             b"19BE666EF9DCBBAC55A06295CE870B07029BFCDB2DCE28D959F2815B15E81798",
@@ -280,9 +308,9 @@ mod test {
         let message = "Bob -> 1 BTC -> Alice";
         let hash = ecdsa.generate_hash_less_than(message, &ecdsa.q_order);
 
-        let signature = ecdsa.sign(&hash, &priv_key, &k_random);
+        let signature = ecdsa.sign(&hash, &priv_key, &k_random).expect("Could not sign");
 
-        let verify_result = ecdsa.verify(&hash, &pub_key, &signature);
+        let verify_result = ecdsa.verify(&hash, &pub_key, &signature).expect("Could not verify");
 
         assert!(verify_result, "Verification should have succeed");
     }
@@ -333,7 +361,7 @@ mod test {
         )
         .expect("Could not convert hex to private key");
 
-        let pub_key = ecdsa.generate_pub_key(&priv_key);
+        let pub_key = ecdsa.generate_pub_key(&priv_key).expect("Could not compute PubKey");
 
         let k_random = BigUint::parse_bytes(
             b"19BE666EF9DCBBAC55A06295CE870B07029BFCDB2DCE28D959F2815B15E81798",
@@ -344,12 +372,12 @@ mod test {
         let message = "Bob -> 1 BTC -> Alice";
         let hash = ecdsa.generate_hash_less_than(message, &ecdsa.q_order);
 
-        let signature = ecdsa.sign(&hash, &priv_key, &k_random);
+        let signature = ecdsa.sign(&hash, &priv_key, &k_random).expect("Could not sign");
 
         let message = "Bob -> 2 BTC -> Alice";
         let hash = ecdsa.generate_hash_less_than(message, &ecdsa.q_order);
 
-        let verify_result = ecdsa.verify(&hash, &pub_key, &signature);
+        let verify_result = ecdsa.verify(&hash, &pub_key, &signature).expect("Could not verify");
 
         assert!(
             !verify_result,
@@ -403,7 +431,7 @@ mod test {
         )
         .expect("Could not convert hex to private key");
 
-        let pub_key = ecdsa.generate_pub_key(&priv_key);
+        let pub_key = ecdsa.generate_pub_key(&priv_key).expect("Could not compute PubKey");
 
         let k_random = BigUint::parse_bytes(
             b"19BE666EF9DCBBAC55A06295CE870B07029BFCDB2DCE28D959F2815B15E81798",
@@ -414,14 +442,15 @@ mod test {
         let message = "Bob -> 1 BTC -> Alice";
         let hash = ecdsa.generate_hash_less_than(message, &ecdsa.q_order);
 
-        let signature = ecdsa.sign(&hash, &priv_key, &k_random);
+        let signature = ecdsa.sign(&hash, &priv_key, &k_random).expect("Could not sign");
         let (r, s) = signature;
+
         let tempered_signature = (
             (r + BigUint::from(1u32)).modpow(&BigUint::from(1u32), &ecdsa.q_order),
             s,
         );
 
-        let verify_result = ecdsa.verify(&hash, &pub_key, &tempered_signature);
+        let verify_result = ecdsa.verify(&hash, &pub_key, &tempered_signature).expect("Could not verify");
 
         assert!(
             !verify_result,

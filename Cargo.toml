@@ -11,4 +11,4 @@ rand = "0.8.5"
 num-bigint = { version="0.4.3", features=["rand"] }
 sha256 = "1.1.4"
 hex = "0.4.3"
-ec-generic = "0.1.10"
+ec-generic = "0.1.14"
